@@ -19,11 +19,25 @@ type BlockStats struct {
 	RecordsCount  int
 }
 
+type ReorganizationReport struct {
+	BlocksBefore     int
+	BlocksAfter      int
+	OccupancyBefore  float64
+	OccupancyAfter   float64
+	EfficiencyBefore float64
+	EfficiencyAfter  float64
+	EfficiencyGain   float64
+	FreedBlocks      int
+}
+
 type Storage interface {
 	WriteStudents(filename string, students []entity.Student) error
 	FindStudentByMatricula(filename string, matricula int) (*entity.Student, error)
 	GetAllStudents(filename string) ([]*entity.Student, error)
 	AddStudents(filename string, students []entity.Student) error
+	UpdateStudent(filename string, student entity.Student) error
+	DeleteStudent(filename string, matricula int) error
+	Reorganize(filename string) (*ReorganizationReport, error)
 	GetStats(filename string) StorageStats
 	ValidateBlockSize(blockSize int) error
 	GetBlockSize() int

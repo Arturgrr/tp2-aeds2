@@ -7,6 +7,11 @@ import (
 	"os"
 )
 
+const (
+	StatusActive  = 0
+	StatusDeleted = 1
+)
+
 type VariableStorage struct {
 	blockSize int
 	stats      StorageStats
@@ -28,7 +33,7 @@ func NewVariableStorage(blockSize int) (*VariableStorage, error) {
 }
 
 func (vs *VariableStorage) ValidateBlockSize(blockSize int) error {
-	minSize := 4 +
+	minSize := 4 + 1 +
 		4 + entity.MaxNomeLength +
 		entity.CPFLength +
 		4 + entity.MaxCursoLength +
@@ -83,48 +88,59 @@ func (vs *VariableStorage) WriteStudents(filename string, students []entity.Stud
 }
 
 func (vs *VariableStorage) serializeStudent(student entity.Student) []byte {
-	data := make([]byte, 0)
+	payload := make([]byte, 0)
 	
 	matriculaBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(matriculaBytes, uint32(student.Matricula))
-	data = append(data, matriculaBytes...)
+	payload = append(payload, matriculaBytes...)
 	
 	nomeBytes := []byte(student.Nome)
 	nomeLen := make([]byte, 4)
 	binary.LittleEndian.PutUint32(nomeLen, uint32(len(nomeBytes)))
-	data = append(data, nomeLen...)
-	data = append(data, nomeBytes...)
+	payload = append(payload, nomeLen...)
+	payload = append(payload, nomeBytes...)
 	
 	cpfBytes := []byte(student.CPF)
-	data = append(data, cpfBytes...)
+	payload = append(payload, cpfBytes...)
 	
 	cursoBytes := []byte(student.Curso)
 	cursoLen := make([]byte, 4)
 	binary.LittleEndian.PutUint32(cursoLen, uint32(len(cursoBytes)))
-	data = append(data, cursoLen...)
-	data = append(data, cursoBytes...)
+	payload = append(payload, cursoLen...)
+	payload = append(payload, cursoBytes...)
 	
 	maeBytes := []byte(student.FiliacaoMae)
 	maeLen := make([]byte, 4)
 	binary.LittleEndian.PutUint32(maeLen, uint32(len(maeBytes)))
-	data = append(data, maeLen...)
-	data = append(data, maeBytes...)
+	payload = append(payload, maeLen...)
+	payload = append(payload, maeBytes...)
 	
 	paiBytes := []byte(student.FiliacaoPai)
 	paiLen := make([]byte, 4)
 	binary.LittleEndian.PutUint32(paiLen, uint32(len(paiBytes)))
-	data = append(data, paiLen...)
-	data = append(data, paiBytes...)
+	payload = append(payload, paiLen...)
+	payload = append(payload, paiBytes...)
 	
 	anoBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(anoBytes, uint32(student.AnoIngresso))
-	data = append(data, anoBytes...)
+	payload = append(payload, anoBytes...)
 	
 	caBytes := make([]byte, 8)
 	binary.LittleEndian.PutUint64(caBytes, uint64(student.CA*100))
-	data = append(data, caBytes...)
+	payload = append(payload, caBytes...)
 	
-	return data
+	totalSize := uint32(1 + len(payload))
+	
+	finalData := make([]byte, 0, 4+totalSize)
+	
+	sizeBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(sizeBytes, totalSize)
+	finalData = append(finalData, sizeBytes...)
+	
+	finalData = append(finalData, byte(StatusActive))
+	finalData = append(finalData, payload...)
+	
+	return finalData
 }
 
 func (vs *VariableStorage) writeContiguousRecord(currentBlock *[]byte, currentBlockNumber *int, blockStats *BlockStats, recordData []byte, file *os.File, isLast bool) {
@@ -208,16 +224,26 @@ func (vs *VariableStorage) recalculateStatsFromFile(filename string) {
 			if offset+4 > vs.blockSize {
 				break
 			}
-
-			student, err := vs.deserializeStudentFromBlock(block, offset)
-			if err != nil {
+			
+			if block[offset] == 0 && block[offset+1] == 0 && block[offset+2] == 0 && block[offset+3] == 0 {
 				break
 			}
 
-			recordSize := vs.getRecordSize(student)
-			bytesUsed += recordSize
-			recordsCount++
-			offset += recordSize
+			student, bytesConsumed, err := vs.deserializeStudentFromBlock(block, offset)
+			if err != nil {
+				if bytesConsumed > 0 {
+					offset += bytesConsumed
+					continue
+				}
+				break
+			}
+
+			if student != nil {
+				recordsCount++
+			}
+			
+			bytesUsed += bytesConsumed
+			offset += bytesConsumed
 		}
 
 		totalUsed += bytesUsed
@@ -274,43 +300,69 @@ func (vs *VariableStorage) findStudentContiguous(file *os.File, totalBlocks int,
 				break
 			}
 
-			matriculaBytes := block[offset : offset+4]
-			readMatricula := int(binary.LittleEndian.Uint32(matriculaBytes))
+			if block[offset] == 0 && block[offset+1] == 0 && block[offset+2] == 0 && block[offset+3] == 0 {
+				break
+			}
+
+			student, bytesConsumed, err := vs.deserializeStudentFromBlock(block, offset)
+			if err != nil {
+				if bytesConsumed > 0 {
+					offset += bytesConsumed
+					continue
+				}
+				break
+			}
 			
-			if readMatricula == matricula {
-				student, err := vs.deserializeStudentFromBlock(block, offset)
-				if err == nil {
+			if student != nil {
+				if student.Matricula == matricula {
 					return student, nil
 				}
 			}
 
-			student, err := vs.deserializeStudentFromBlock(block, offset)
-			if err != nil {
-				break
-			}
-			offset += vs.getRecordSize(student)
+			offset += bytesConsumed
 		}
 	}
 
 	return nil, fmt.Errorf("aluno com matrícula %d não encontrado", matricula)
 }
 
-func (vs *VariableStorage) deserializeStudentFromBlock(block []byte, offset int) (*entity.Student, error) {
+func (vs *VariableStorage) deserializeStudentFromBlock(block []byte, offset int) (*entity.Student, int, error) {
 	if offset+4 > len(block) {
-		return nil, fmt.Errorf("offset fora dos limites")
+		return nil, 0, fmt.Errorf("offset fora dos limites")
 	}
 
-	recordData := block[offset:]
+	totalSize := int(binary.LittleEndian.Uint32(block[offset : offset+4]))
+	
+	if totalSize == 0 {
+		return nil, 0, fmt.Errorf("tamanho de registro zero encontrado")
+	}
+
+	if offset+4+totalSize > len(block) {
+		return nil, 0, fmt.Errorf("registro excede limites do bloco")
+	}
+
+	status := block[offset+4]
+	
+	bytesConsumed := 4 + totalSize
+
+	if status == StatusDeleted {
+		return nil, bytesConsumed, nil 
+	}
+
+	payloadStart := offset + 5
+	payloadEnd := offset + 4 + totalSize
+
+	recordData := block[payloadStart:payloadEnd]
 	student, err := vs.deserializeStudent(recordData)
 	if err != nil {
-		return nil, err
+		return nil, bytesConsumed, err
 	}
 
-	return student, nil
+	return student, bytesConsumed, nil
 }
 
 func (vs *VariableStorage) getRecordSize(student *entity.Student) int {
-	size := 4
+	size := 4 + 1
 	size += 4 + len(student.Nome)
 	size += 11
 	size += 4 + len(student.Curso)
@@ -449,40 +501,314 @@ func (vs *VariableStorage) GetAllStudents(filename string) ([]*entity.Student, e
 				break
 			}
 
-			student, err := vs.deserializeStudentFromBlock(block, offset)
+			if block[offset] == 0 && block[offset+1] == 0 && block[offset+2] == 0 && block[offset+3] == 0 {
+				break
+			}
+
+			student, bytesConsumed, err := vs.deserializeStudentFromBlock(block, offset)
 			if err != nil {
+				if bytesConsumed > 0 {
+					offset += bytesConsumed
+					continue
+				}
 				break
 			}
 			
-			if student.Matricula > 0 {
+			if student != nil && student.Matricula > 0 {
 				students = append(students, student)
 			}
 			
-			offset += vs.getRecordSize(student)
+			offset += bytesConsumed
 		}
 	}
 
 	return students, nil
 }
 
+// AddStudents com inserção inteligente (Best/First Fit no final dos blocos)
 func (vs *VariableStorage) AddStudents(filename string, students []entity.Student) error {
-	existingStudents, err := vs.GetAllStudents(filename)
+	vs.recalculateStatsFromFile(filename)
+
+	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
-		return fmt.Errorf("erro ao ler alunos existentes: %w", err)
+		return fmt.Errorf("erro ao abrir arquivo: %w", err)
 	}
+	defer file.Close()
 
-	allStudents := make([]entity.Student, len(existingStudents))
-	for i, s := range existingStudents {
-		allStudents[i] = *s
-	}
+	for _, student := range students {
+		recordData := vs.serializeStudent(student)
+		recordSize := len(recordData)
 
-	allStudents = append(allStudents, students...)
+		if recordSize > vs.blockSize {
+			return fmt.Errorf("registro muito grande para o bloco")
+		}
 
-	err = vs.WriteStudents(filename, allStudents)
-	if err != nil {
-		return err
+		inserted := false
+
+		for i, blockStats := range vs.stats.BlockStatsList {
+			if blockStats.BytesUsed + recordSize <= vs.blockSize {
+				block := make([]byte, vs.blockSize)
+				_, err := file.ReadAt(block, int64(i * vs.blockSize))
+				if err == nil {
+					offset := 0
+					for offset < vs.blockSize {
+						if offset+4 > vs.blockSize { break }
+						sz := int(binary.LittleEndian.Uint32(block[offset:offset+4]))
+						if sz == 0 { break }
+						offset += 4 + sz
+					}
+					
+					if offset + recordSize <= vs.blockSize {
+						copy(block[offset:], recordData)
+						vs.writeBlockAt(file, block, int64(i))
+						
+						vs.stats.BlockStatsList[i].BytesUsed += recordSize
+						vs.stats.TotalBytesUsed += recordSize
+						inserted = true
+						break
+					}
+				}
+			}
+		}
+
+		if inserted {
+			continue
+		}
+
+		newBlock := make([]byte, vs.blockSize)
+		copy(newBlock, recordData)
+		
+		offset := int64(vs.stats.TotalBlocks * vs.blockSize)
+		_, err = file.WriteAt(newBlock, offset)
+		if err != nil {
+			return err
+		}
+
+		vs.stats.TotalBlocks++
+		vs.stats.TotalBytesTotal += vs.blockSize
+		vs.stats.TotalBytesUsed += recordSize
+		
+		newStat := BlockStats{
+			BlockNumber: vs.stats.TotalBlocks - 1,
+			BytesUsed: recordSize,
+			BytesTotal: vs.blockSize,
+		}
+		vs.stats.BlockStatsList = append(vs.stats.BlockStatsList, newStat)
 	}
 
 	vs.calculateFinalStats()
 	return nil
+}
+
+// Reorganize: Compactação física
+func (vs *VariableStorage) Reorganize(filename string) (*ReorganizationReport, error) {
+	statsBefore := vs.GetStats(filename)
+
+	students, err := vs.GetAllStudents(filename)
+	if err != nil {
+		return nil, err
+	}
+
+	reorgFilename := filename
+	if len(filename) > 4 && filename[len(filename)-4:] == ".dat" {
+		reorgFilename = filename[:len(filename)-4] + "_reorg.dat"
+	} else {
+		reorgFilename = filename + "_reorg.dat"
+	}
+
+	tempStorage, err := NewVariableStorage(vs.blockSize)
+	if err != nil {
+		return nil, err
+	}
+	
+	studentsValue := make([]entity.Student, len(students))
+	for i, s := range students {
+		studentsValue[i] = *s
+	}
+	
+	err = tempStorage.WriteStudents(reorgFilename, studentsValue)
+	if err != nil {
+		return nil, err
+	}
+	
+	statsAfter := tempStorage.GetStats(reorgFilename)
+	
+	occBefore := 0.0
+	if statsBefore.TotalBlocks > 0 {
+		sum := 0.0
+		for _, b := range statsBefore.BlockStatsList {
+			sum += b.OccupancyRate
+		}
+		occBefore = sum / float64(statsBefore.TotalBlocks)
+	}
+	
+	occAfter := 0.0
+	if statsAfter.TotalBlocks > 0 {
+		sum := 0.0
+		for _, b := range statsAfter.BlockStatsList {
+			sum += b.OccupancyRate
+		}
+		occAfter = sum / float64(statsAfter.TotalBlocks)
+	}
+
+	report := &ReorganizationReport{
+		BlocksBefore:     statsBefore.TotalBlocks,
+		BlocksAfter:      statsAfter.TotalBlocks,
+		OccupancyBefore:  occBefore,
+		OccupancyAfter:   occAfter,
+		EfficiencyBefore: statsBefore.EfficiencyRate,
+		EfficiencyAfter:  statsAfter.EfficiencyRate,
+		EfficiencyGain:   statsAfter.EfficiencyRate - statsBefore.EfficiencyRate,
+		FreedBlocks:      statsBefore.TotalBlocks - statsAfter.TotalBlocks,
+	}
+	
+	return report, nil
+}
+
+// FindStudentLocation e helpers
+func (vs *VariableStorage) findStudentLocation(file *os.File, totalBlocks int, matricula int) (int, int, int, error) {
+	for blockNum := 0; blockNum < totalBlocks; blockNum++ {
+		block := make([]byte, vs.blockSize)
+		_, err := file.ReadAt(block, int64(blockNum*vs.blockSize))
+		if err != nil {
+			continue
+		}
+
+		offset := 0
+		for offset < vs.blockSize {
+			if offset+4 > vs.blockSize {
+				break
+			}
+			
+			if block[offset] == 0 && block[offset+1] == 0 && block[offset+2] == 0 && block[offset+3] == 0 {
+				break
+			}
+
+			totalSize := int(binary.LittleEndian.Uint32(block[offset : offset+4]))
+			if totalSize == 0 || offset+4+totalSize > len(block) {
+				break
+			}
+			
+			status := block[offset+4]
+			bytesConsumed := 4 + totalSize
+
+			if status == StatusDeleted {
+				offset += bytesConsumed
+				continue
+			}
+
+			if offset+9 <= len(block) {
+				matrBytes := block[offset+5 : offset+9]
+				readMatricula := int(binary.LittleEndian.Uint32(matrBytes))
+				
+				if readMatricula == matricula {
+					return blockNum, offset, bytesConsumed, nil
+				}
+			}
+
+			offset += bytesConsumed
+		}
+	}
+	return -1, -1, 0, fmt.Errorf("aluno não encontrado")
+}
+
+func (vs *VariableStorage) UpdateStudent(filename string, updatedStudent entity.Student) error {
+	file, err := os.OpenFile(filename, os.O_RDWR, 0644)
+	if err != nil {
+		return fmt.Errorf("erro ao abrir arquivo: %w", err)
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("erro ao ler stats: %w", err)
+	}
+	totalBlocks := int(fileInfo.Size()) / vs.blockSize
+
+	blockNum, offset, oldTotalSize, err := vs.findStudentLocation(file, totalBlocks, updatedStudent.Matricula)
+	if err != nil {
+		return err
+	}
+
+	newRecord := vs.serializeStudent(updatedStudent)
+	newTotalSize := len(newRecord)
+
+	block := make([]byte, vs.blockSize)
+	blockStart := int64(blockNum * vs.blockSize)
+	_, err = file.ReadAt(block, blockStart)
+	if err != nil {
+		return err
+	}
+
+	realBytesUsed := 0
+	checkOffset := 0
+	for checkOffset < vs.blockSize {
+		if checkOffset+4 > vs.blockSize { break }
+		ts := int(binary.LittleEndian.Uint32(block[checkOffset:checkOffset+4]))
+		if ts == 0 { break }
+		realBytesUsed += 4 + ts
+		checkOffset += 4 + ts
+	}
+
+	spaceFree := vs.blockSize - realBytesUsed
+	sizeDiff := newTotalSize - oldTotalSize
+
+	canFitInBlock := (spaceFree >= sizeDiff)
+
+	if canFitInBlock {
+		newBlock := make([]byte, 0, vs.blockSize)
+		newBlock = append(newBlock, block[:offset]...)
+		newBlock = append(newBlock, newRecord...)
+		remainingStart := offset + oldTotalSize
+		if remainingStart < realBytesUsed {
+			newBlock = append(newBlock, block[remainingStart:realBytesUsed]...)
+		}
+		
+		vs.writeBlockAt(file, newBlock, int64(blockNum))
+		vs.recalculateStatsFromFile(filename)
+		return nil
+	}
+
+	_, err = file.WriteAt([]byte{StatusDeleted}, blockStart+int64(offset)+4)
+	if err != nil {
+		return err
+	}
+	
+	file.Close() 
+	
+	return vs.AddStudents(filename, []entity.Student{updatedStudent})
+}
+
+func (vs *VariableStorage) DeleteStudent(filename string, matricula int) error {
+	file, err := os.OpenFile(filename, os.O_RDWR, 0644)
+	if err != nil {
+		return fmt.Errorf("erro ao abrir arquivo: %w", err)
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("erro ao obter status do arquivo: %w", err)
+	}
+
+	totalBlocks := int(fileInfo.Size()) / vs.blockSize
+	blockNum, offset, _, err := vs.findStudentLocation(file, totalBlocks, matricula)
+	if err != nil {
+		return fmt.Errorf("aluno não encontrado")
+	}
+
+	statusOffset := int64(blockNum*vs.blockSize) + int64(offset) + 4
+	_, err = file.WriteAt([]byte{StatusDeleted}, statusOffset)
+	
+	if err == nil {
+		vs.recalculateStatsFromFile(filename)
+	}
+	return err
+}
+
+func (vs *VariableStorage) writeBlockAt(file *os.File, block []byte, blockIndex int64) error {
+	padded := make([]byte, vs.blockSize)
+	copy(padded, block)
+	_, err := file.WriteAt(padded, blockIndex*int64(vs.blockSize))
+	return err
 }
